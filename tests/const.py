@@ -203,6 +203,7 @@ ENTITY_DESCRIPTIONS: _EntityDescriptionsType = {
             key="Test.Light.4",
             name="Light.4",
             entity="Test.Lighting",
+            brightness_entity="Test.LightingBrightness",
             color_entity="Test.LightingCustomColor",
             color_mode_entity="Test.LightingColor",
         ),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.light import (
@@ -24,7 +25,7 @@ from homeconnect_websocket.message import Action
 from homeconnect_websocket.message import Message as HC_Message
 
 from .entity import HCEntity
-from .helpers import create_entities, entity_is_available, error_decorator
+from .helpers import create_entities, error_decorator
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -106,29 +107,14 @@ class HCLight(HCEntity, LightEntity):
             self._attr_color_mode = ColorMode.ONOFF
 
     @property
-    def available(self) -> bool:
-        available = super().available
-        if self._brightness_entity:
-            available &= entity_is_available(
-                self._brightness_entity, self.entity_description.available_access
-            )
-        if self._color_temperature_entity:
-            available &= entity_is_available(
-                self._color_temperature_entity, self.entity_description.available_access
-            )
-        if self._color_entity:
-            available &= entity_is_available(
-                self._color_entity, self.entity_description.available_access
-            )
-        return available
-
-    @property
     def is_on(self) -> bool | None:
         return bool(self._entity.value)
 
     @property
     def brightness(self) -> int | None:
         if self._color_entity is not None:
+            if self._color_entity.value is None:
+                return None
             rgb = rgb_hex_to_rgb_list(self._color_entity.value.strip("#"))
             return max(rgb)
         if self._brightness_entity is not None:
@@ -155,34 +141,64 @@ class HCLight(HCEntity, LightEntity):
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
         if self._color_entity is not None:
+            if self._color_entity.value is None:
+                return None
             rgb = rgb_hex_to_rgb_list(self._color_entity.value.strip("#"))
             return match_max_scale((255,), rgb)
         return None
 
+    _WRITABLE_WAIT_TIMEOUT = 3.0
+
+    async def _wait_until_writable(self, entity: HcEntity) -> None:
+        """Wait until the appliance reports the entity as writable, or give up."""
+        if getattr(entity, "available", True):
+            return
+        event = asyncio.Event()
+
+        async def callback(_: HcEntity) -> None:
+            if getattr(entity, "available", True):
+                event.set()
+
+        entity.register_callback(callback)
+        try:
+            async with asyncio.timeout(self._WRITABLE_WAIT_TIMEOUT):
+                await event.wait()
+        except TimeoutError:
+            pass
+        finally:
+            entity.unregister_callback(callback)
+
     @error_decorator
     async def async_turn_on(self, **kwargs: Any) -> None:
-        message = HC_Message(
-            resource="/ro/values",
-            action=Action.POST,
-            data=[],
-        )
         brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
         rgb = kwargs.get(ATTR_RGB_COLOR, self.rgb_color)
 
-        if self._attr_color_mode == ColorMode.RGB:
+        attribute_writes: list[dict[str, Any]] = []
+        wait_target: HcEntity | None = None
+
+        if self._attr_color_mode == ColorMode.RGB and (
+            ATTR_BRIGHTNESS in kwargs or ATTR_RGB_COLOR in kwargs
+        ):
+            if rgb is None:
+                rgb = (255, 255, 255)
+            if brightness is None:
+                brightness = 255
             rgb_with_brightness = tuple(color * brightness // 255 for color in rgb)
-            message.data.append(
+            attribute_writes.append(
                 {
                     "uid": self._color_entity.uid,
                     "value": "#" + color_rgb_to_hex(*rgb_with_brightness),
                 }
             )
+            wait_target = self._color_entity
             if (
                 self._color_mode_entity is not None
                 and self._color_mode_entity.value != "CustomColor"
             ):
                 color_mode_value = self._color_mode_entity._rev_enumeration["CustomColor"]  # noqa: SLF001
-                message.data.append({"uid": self._color_mode_entity.uid, "value": color_mode_value})
+                attribute_writes.append(
+                    {"uid": self._color_mode_entity.uid, "value": color_mode_value}
+                )
 
         elif (
             self._attr_color_mode in (ColorMode.BRIGHTNESS, ColorMode.COLOR_TEMP)
@@ -194,7 +210,10 @@ class HCLight(HCEntity, LightEntity):
                     self._brightness_entity.min,
                 )
             )
-            message.data.append({"uid": self._brightness_entity.uid, "value": value_in_range})
+            attribute_writes.append(
+                {"uid": self._brightness_entity.uid, "value": value_in_range}
+            )
+            wait_target = self._brightness_entity
 
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             if self._color_temp_inverted:
@@ -213,13 +232,38 @@ class HCLight(HCEntity, LightEntity):
                         kwargs[ATTR_COLOR_TEMP_KELVIN],
                     )
                 )
-            message.data.append(
+            attribute_writes.append(
                 {"uid": self._color_temperature_entity.uid, "value": value_in_range}
             )
+            if wait_target is None:
+                wait_target = self._color_temperature_entity
 
-        if self._entity.value is not True:
-            message.data.append({"uid": self._entity.uid, "value": True})
-        await self._runtime_data.appliance.session.send_sync(message)
+        await self._dispatch_turn_on(attribute_writes, wait_target)
+
+    async def _dispatch_turn_on(
+        self,
+        attribute_writes: list[dict[str, Any]],
+        wait_target: HcEntity | None,
+    ) -> None:
+        is_off = self._entity.value is not True
+        if is_off and attribute_writes:
+            # Two-phase: appliances like Bosch/Siemens hoods gate sub-entities
+            # on the light being on (and validate batched writes upfront), so a
+            # combined message is rejected. Send the on-switch alone, wait for
+            # the target sub-entity to become writable, then send the rest.
+            await self._send_data([{"uid": self._entity.uid, "value": True}])
+            if wait_target is not None:
+                await self._wait_until_writable(wait_target)
+            await self._send_data(attribute_writes)
+        elif is_off:
+            await self._send_data([{"uid": self._entity.uid, "value": True}])
+        elif attribute_writes:
+            await self._send_data(attribute_writes)
+
+    async def _send_data(self, data: list[dict[str, Any]]) -> None:
+        await self._runtime_data.appliance.session.send_sync(
+            HC_Message(resource="/ro/values", action=Action.POST, data=data)
+        )
 
     @error_decorator
     async def async_turn_off(self, **kwargs: Any) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import call
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -23,6 +24,7 @@ from homeassistant.const import (
     ATTR_FRIENDLY_NAME,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
 )
 from homeconnect_websocket.message import Action, Message
 
@@ -369,17 +371,25 @@ async def test_set_brightness_color_temp(
         blocking=True,
     )
 
-    mock_appliance.session.send_sync.assert_awaited_once_with(
-        Message(
-            resource="/ro/values",
-            action=Action.POST,
-            data=[
-                {"uid": 109, "value": 100},
-                {"uid": 110, "value": 100},
-                {"uid": 108, "value": True},
-            ],
-        )
-    )
+    assert mock_appliance.session.send_sync.await_args_list == [
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[{"uid": 108, "value": True}],
+            )
+        ),
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[
+                    {"uid": 109, "value": 100},
+                    {"uid": 110, "value": 100},
+                ],
+            )
+        ),
+    ]
     mock_appliance.session.send_sync.reset_mock()
 
     await mock_appliance.entities["Test.Lighting"].update({"value": True})
@@ -532,17 +542,25 @@ async def test_set_brightness_color_temp_inverted(
         blocking=True,
     )
 
-    mock_appliance.session.send_sync.assert_awaited_once_with(
-        Message(
-            resource="/ro/values",
-            action=Action.POST,
-            data=[
-                {"uid": 109, "value": 100},
-                {"uid": 110, "value": 0},
-                {"uid": 108, "value": True},
-            ],
-        )
-    )
+    assert mock_appliance.session.send_sync.await_args_list == [
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[{"uid": 108, "value": True}],
+            )
+        ),
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[
+                    {"uid": 109, "value": 100},
+                    {"uid": 110, "value": 0},
+                ],
+            )
+        ),
+    ]
     mock_appliance.session.send_sync.reset_mock()
 
     await mock_appliance.entities["Test.Lighting"].update({"value": True})
@@ -571,6 +589,111 @@ async def test_set_brightness_color_temp_inverted(
             ],
         )
     )
+
+
+async def test_rgb_available_when_sub_entities_gated(
+    hass: HomeAssistant,
+    mock_appliance: MockAppliance,
+    patch_entity_description: None,  # noqa: ARG001
+) -> None:
+    """
+    RGB light stays available regardless of sub-entity availability.
+
+    Real Bosch/Siemens hoods gate AmbientLightBrightness and AmbientLightCustomColor
+    based on AmbientLightColor mode (brightness writable in preset modes, custom
+    color writable in CustomColor mode) and report both as unavailable when the
+    light is off. The light entity itself should track only the main on/off entity
+    so the user can always toggle it.
+    """
+    assert await setup_config_entry(hass, MOCK_CONFIG_DATA)
+    await mock_appliance.entities["Test.Lighting"].update({"value": True})
+    await hass.async_block_till_done()
+
+    # Preset mode: brightness available, custom color not
+    await mock_appliance.entities["Test.LightingBrightness"].update({"available": True})
+    await mock_appliance.entities["Test.LightingCustomColor"].update({"available": False})
+    await hass.async_block_till_done()
+    state = hass.states.get("light.fake_brand_homeappliance_light_4")
+    assert state.state != STATE_UNAVAILABLE
+
+    # CustomColor mode: custom color available, brightness not
+    await mock_appliance.entities["Test.LightingBrightness"].update({"available": False})
+    await mock_appliance.entities["Test.LightingCustomColor"].update({"available": True})
+    await hass.async_block_till_done()
+    state = hass.states.get("light.fake_brand_homeappliance_light_4")
+    assert state.state != STATE_UNAVAILABLE
+
+    # Light off: appliance reports both sub-entities as unavailable; user must
+    # still be able to turn it back on.
+    await mock_appliance.entities["Test.Lighting"].update({"value": False})
+    await mock_appliance.entities["Test.LightingBrightness"].update({"available": False})
+    await mock_appliance.entities["Test.LightingCustomColor"].update({"available": False})
+    await hass.async_block_till_done()
+    state = hass.states.get("light.fake_brand_homeappliance_light_4")
+    assert state.state != STATE_UNAVAILABLE
+
+
+async def test_on_color_value_none(
+    hass: HomeAssistant,
+    mock_appliance: MockAppliance,
+    patch_entity_description: None,  # noqa: ARG001
+) -> None:
+    """Test turn on when the color entity value has never been reported."""
+    mock_appliance.entities["Test.LightingCustomColor"]._value = None
+    assert await setup_config_entry(hass, MOCK_CONFIG_DATA)
+    await mock_appliance.entities["Test.Lighting"].update({"value": False})
+    await hass.async_block_till_done()
+
+    state = hass.states.get("light.fake_brand_homeappliance_light_4")
+    assert state.state == STATE_OFF
+    assert state.attributes.get(ATTR_BRIGHTNESS) is None
+    assert state.attributes.get(ATTR_RGB_COLOR) is None
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.fake_brand_homeappliance_light_4",
+        },
+        blocking=True,
+    )
+    mock_appliance.session.send_sync.assert_awaited_once_with(
+        Message(
+            resource="/ro/values",
+            action=Action.POST,
+            data=[{"uid": 108, "value": True}],
+        )
+    )
+    mock_appliance.session.send_sync.reset_mock()
+
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_ON,
+        {
+            ATTR_ENTITY_ID: "light.fake_brand_homeappliance_light_4",
+            ATTR_RGB_COLOR: (0, 255, 0),
+        },
+        blocking=True,
+    )
+    assert mock_appliance.session.send_sync.await_args_list == [
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[{"uid": 108, "value": True}],
+            )
+        ),
+        call(
+            Message(
+                resource="/ro/values",
+                action=Action.POST,
+                data=[
+                    {"uid": 111, "value": "#00ff00"},
+                    {"uid": 112, "value": 1},
+                ],
+            )
+        ),
+    ]
 
 
 async def test_update_color(
