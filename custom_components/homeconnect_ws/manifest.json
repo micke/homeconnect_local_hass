@@ -1,6 +1,6 @@
 {
   "domain": "homeconnect_ws",
-  "name": "Home Connect Local",
+  "name": "Home Connect Local (Micke)",
   "after_dependencies": [
     "file_upload"
   ],
